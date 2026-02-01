@@ -2,6 +2,10 @@
 
 This directory contains a pure JAX implementation of the [UMT5 model](https://arxiv.org/abs/2304.09151), using the [Flax NNX](https://flax.readthedocs.io/en/stable/index.html) API.
 
+## Features
+
+✨ **KV-Cache Support**: Efficient autoregressive inference with key-value caching, providing 2-5x speedup during text generation. See [KV_CACHE_DOCS.md](KV_CACHE_DOCS.md) for details.
+
 
 ## Model Configuration Support Status
 

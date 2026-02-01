@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import math
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -84,6 +84,48 @@ class UMT5Config:
                 f"`feed_forward_proj`: {self.feed_forward_proj} is not a valid activation function of the dense layer. "
                 f"Supported activation functions are: {', '.join(ACT_FN.keys())}"
             )
+
+
+@dataclasses.dataclass
+class Cache:
+    decoder_key: Optional[jax.Array] = None
+    decoder_value: Optional[jax.Array] = None
+    encoder_key: Optional[jax.Array] = None
+    encoder_value: Optional[jax.Array] = None
+    decoder_position: int = 0
+
+
+def init_cache(
+    config: UMT5Config,
+    batch_size: int,
+    max_decoder_length: int,
+    encoder_length: Optional[int] = None,
+    dtype: DTypeLike = jnp.float32,
+) -> Cache:
+    decoder_key = jnp.zeros(
+        (batch_size, max_decoder_length, config.num_heads, config.d_kv), dtype=dtype
+    )
+    decoder_value = jnp.zeros(
+        (batch_size, max_decoder_length, config.num_heads, config.d_kv), dtype=dtype
+    )
+    
+    encoder_key = None
+    encoder_value = None
+    if encoder_length is not None:
+        encoder_key = jnp.zeros(
+            (batch_size, encoder_length, config.num_heads, config.d_kv), dtype=dtype
+        )
+        encoder_value = jnp.zeros(
+            (batch_size, encoder_length, config.num_heads, config.d_kv), dtype=dtype
+        )
+    
+    return Cache(
+        decoder_key=decoder_key,
+        decoder_value=decoder_value,
+        encoder_key=encoder_key,
+        encoder_value=encoder_value,
+        decoder_position=0,
+    )
 
 
 class T5LayerNorm(nnx.Module):
@@ -287,16 +329,45 @@ class UMT5Attention(nnx.Module):
         hidden_states: jax.Array,
         encoder_hidden_states: Optional[jax.Array] = None,
         attention_mask: Optional[jax.Array] = None,
+        cache: Optional[Cache] = None,
+        use_cache: bool = False,
     ):
         b, n, c = hidden_states.shape[0], self.n_heads, self.key_value_proj_dim
 
-        # if encoder_hidden_states are provided this layer is used as a cross-attention layer for the decoder
         is_cross_attention = encoder_hidden_states is not None
         current_states = encoder_hidden_states if is_cross_attention else hidden_states
 
         q = self.q(hidden_states).reshape(b, -1, n, c)
-        k = self.k(current_states).reshape(b, -1, n, c)
-        v = self.v(current_states).reshape(b, -1, n, c)
+        
+        if use_cache and cache is not None:
+            if is_cross_attention:
+                if cache.encoder_key is None:
+                    k = self.k(current_states).reshape(b, -1, n, c)
+                    v = self.v(current_states).reshape(b, -1, n, c)
+                    cache.encoder_key = k
+                    cache.encoder_value = v
+                else:
+                    k = cache.encoder_key
+                    v = cache.encoder_value
+            else:
+                k_new = self.k(current_states).reshape(b, -1, n, c)
+                v_new = self.v(current_states).reshape(b, -1, n, c)
+                
+                if cache.decoder_position == 0:
+                    k = k_new
+                    v = v_new
+                else:
+                    k_cached = cache.decoder_key[:, :cache.decoder_position, :, :]
+                    v_cached = cache.decoder_value[:, :cache.decoder_position, :, :]
+                    k = jnp.concatenate([k_cached, k_new], axis=1)
+                    v = jnp.concatenate([v_cached, v_new], axis=1)
+                
+                seq_len = k_new.shape[1]
+                cache.decoder_key = cache.decoder_key.at[:, cache.decoder_position:cache.decoder_position + seq_len, :, :].set(k_new)
+                cache.decoder_value = cache.decoder_value.at[:, cache.decoder_position:cache.decoder_position + seq_len, :, :].set(v_new)
+        else:
+            k = self.k(current_states).reshape(b, -1, n, c)
+            v = self.v(current_states).reshape(b, -1, n, c)
 
         # Attention bias
         q_len, k_len = q.shape[1], k.shape[1]
@@ -359,11 +430,15 @@ class UMT5LayerSelfAttention(nnx.Module):
         self,
         hidden_states: jax.Array,
         attention_mask=None,
+        cache: Optional[Cache] = None,
+        use_cache: bool = False,
     ):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.SelfAttention(
             normed_hidden_states,
             attention_mask=attention_mask,
+            cache=cache,
+            use_cache=use_cache,
         )
         outputs = hidden_states + attention_output
         return outputs
@@ -390,12 +465,16 @@ class UMT5LayerCrossAttention(nnx.Module):
         hidden_states: jax.Array,
         encoder_hidden_states: jax.Array = None,
         attention_mask: jax.Array = None,
+        cache: Optional[Cache] = None,
+        use_cache: bool = False,
     ):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.EncDecAttention(
             normed_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             attention_mask=attention_mask,
+            cache=cache,
+            use_cache=use_cache,
         )
         return hidden_states + self.dropout(attention_output)
 
@@ -424,12 +503,16 @@ class UMT5Block(nnx.Module):
         attention_mask: jax.Array = None,
         encoder_hidden_states: jax.Array = None,
         encoder_attention_mask: jax.Array = None,
+        cache: Optional[Cache] = None,
+        use_cache: bool = False,
     ):
         # Apply self-attention layer
         hidden_states = fp16_clamp(
             self.layer[0](
                 hidden_states,
                 attention_mask=attention_mask,
+                cache=cache,
+                use_cache=use_cache,
             )
         )
         # Cross-Attention Block
@@ -440,6 +523,8 @@ class UMT5Block(nnx.Module):
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=encoder_attention_mask,
+                    cache=cache,
+                    use_cache=use_cache,
                 )
             )
 
@@ -544,6 +629,8 @@ class UMT5Stack(nnx.Module):
         attention_mask: jax.Array = None,
         encoder_hidden_states: jax.Array = None,
         encoder_attention_mask: jax.Array = None,
+        cache: Optional[Cache] = None,
+        use_cache: bool = False,
     ):
         inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = self.dropout(inputs_embeds)
@@ -559,6 +646,8 @@ class UMT5Stack(nnx.Module):
                 attention_mask=causal_mask,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
+                cache=cache,
+                use_cache=use_cache,
             )
             hidden_states = layer_outputs[0]
         hidden_states = self.final_layer_norm(hidden_states)
@@ -657,61 +746,62 @@ class UMT5Model(nnx.Module):
 
         return decoder_outputs
 
-    # TODO(#96): Implement KV Cache for efficient inference
     def generate(
         self,
         input_ids: jax.Array,
         attention_mask: jax.Array = None,
         max_tokens: Optional[int] = None,
         max_new_tokens: Optional[int] = None,
+        use_cache: bool = True,
     ) -> jax.Array:
-        """Generate sequences using greedy decoding.
-
-        Args:
-            input_ids: Encoder input ids from tokenizer, shape (batch_size, seq_length)
-            attention_mask: Encoder attention mask, shape (batch_size, seq_length)
-            max_tokens: Maximum total length of decoder sequence (including start token).
-                       Takes precedence over max_new_tokens if both are provided.
-            max_new_tokens: Maximum number of new tokens to generate (excluding start token)
-
-        Returns:
-            Generated token ids, shape (batch_size, generated_length)
-        """
-        # Determine maximum generation length
         if max_tokens is not None:
             max_length = max_tokens
         elif max_new_tokens is not None:
-            max_length = max_new_tokens + 1  # +1 for decoder_start_token
+            max_length = max_new_tokens + 1
         else:
-            max_length = 512  # default value
+            max_length = 512
 
-        # Encode input
         encoder_outputs = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
 
-        # Initialize decoder input with start token
         batch_size = input_ids.shape[0]
         decoder_input_ids = jnp.full((batch_size, 1), self.config.decoder_start_token_id, dtype=jnp.int32)
 
-        # Autoregressive generation loop
-        for _ in range(max_length - 1):
-            # Decoder forward pass
-            decoder_outputs = self.decoder(
-                input_ids=decoder_input_ids,
-                encoder_hidden_states=encoder_outputs,
+        cache = None
+        if use_cache:
+            encoder_length = encoder_outputs.shape[1]
+            cache = init_cache(
+                self.config,
+                batch_size=batch_size,
+                max_decoder_length=max_length,
+                encoder_length=encoder_length,
+                dtype=encoder_outputs.dtype,
             )
 
-            # Get logits and select next token (greedy)
+        for step in range(max_length - 1):
+            if use_cache and step > 0:
+                current_input = decoder_input_ids[:, -1:]
+            else:
+                current_input = decoder_input_ids
+
+            decoder_outputs = self.decoder(
+                input_ids=current_input,
+                encoder_hidden_states=encoder_outputs,
+                attention_mask=attention_mask,
+                cache=cache,
+                use_cache=use_cache,
+            )
+
             logits = self.lm_head(decoder_outputs)
-            # here use simple greedy, but beem search is recommended
             next_token = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
 
-            # Append to decoder input
             decoder_input_ids = jnp.concatenate([decoder_input_ids, next_token], axis=1)
 
-            # Stop if all sequences generated EOS
+            if use_cache and cache is not None:
+                cache.decoder_position += current_input.shape[1]
+
             if jnp.all(next_token == self.config.eos_token_id):
                 break
 
@@ -739,4 +829,6 @@ def forward(
     )
 
 
-__all__ = ["UMT5EncoderModel", "UMT5Model"]
+
+
+__all__ = ["UMT5EncoderModel", "UMT5Model", "UMT5Config", "Cache", "init_cache"]
